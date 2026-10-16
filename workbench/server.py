@@ -1,9 +1,9 @@
-"""Loopback-only, single-user local workbench. No cloud upload or paid API."""
+"""Loopback-only, single-user local workbench. Optional text-only DeepSeek API; audio/video stay local."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, unquote, quote
 import argparse, concurrent.futures, json, os, re, shutil, subprocess, sys, threading, uuid, webbrowser
-from . import draft
+from . import draft, semantic
 from .pipeline import save, state
 
 WEB=Path(__file__).parent/'web'
@@ -35,6 +35,7 @@ def worker(action,folder):
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self,fmt,*args):
         # Avoid query strings and original filenames in routine terminal logs.
+        if self.command=='GET' and urlparse(self.path).path=='/api/projects':return
         print(f'{self.command} {urlparse(self.path).path}: {args[1] if len(args)>1 else ""}',flush=True)
 
     def json(self,value,status=200):
@@ -54,7 +55,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.allowed():self.send_error(403);return
         path=unquote(urlparse(self.path).path)
         try:
-            if path=='/health':return self.json({'app':'jianying-subtitle-workbench','version':'0.1.0'})
+            if path=='/health':return self.json({'app':'jianying-subtitle-workbench','version':'0.2.0'})
+            if path=='/api/deepseek':return self.json({'configured':semantic.configured(),'model':semantic.MODEL,'storage':'本机独立配置文件，权限600'})
             if path=='/api/projects':
                 items=[]
                 for f in DATA.glob('*/input.json'):
@@ -86,10 +88,13 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.allowed():self.send_error(403);return
         path=unquote(urlparse(self.path).path)
         try:
+            if path=='/api/deepseek':
+                semantic.save_key(self.body().get('api_key',''));return self.json({'configured':True,'model':semantic.MODEL})
             if path=='/api/projects':
                 body=self.body();filename=Path(body.get('filename','video.mp4')).name
                 if Path(filename).suffix.lower() not in {'.mp4','.mov','.mkv','.webm','.m4v'}:raise ValueError('请选择 MP4、MOV、MKV 或 WebM 视频')
-                opts=body.get('options',{});opts={'max_chars':max(10,min(40,int(opts.get('max_chars',22)))),'keywords':str(opts.get('keywords',''))[:2000],'prompt':str(opts.get('prompt',''))[:1500]}
+                opts=body.get('options',{});opts={'max_chars':max(10,min(40,int(opts.get('max_chars',22)))),'keywords':str(opts.get('keywords',''))[:2000],'prompt':str(opts.get('prompt',''))[:1500],'semantic_mode':'deepseek' if opts.get('semantic_mode')=='deepseek' else 'rules'}
+                if opts['semantic_mode']=='deepseek' and not semantic.configured():raise ValueError('请先配置 DeepSeek 密钥，或关闭 AI 辅助')
                 pid=uuid.uuid4().hex;folder=DATA/pid;folder.mkdir();save(folder/'input.json',{'id':pid,'filename':filename,'options':opts});state(folder,'created','等待导入视频')
                 return self.json({'id':pid},201)
             m=re.fullmatch(r'/api/projects/([a-f0-9]{32})/(video|finalize)',path)

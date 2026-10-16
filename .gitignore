@@ -13,3 +13,6 @@ logs/
 *.wav
 *.safetensors
 *.log
+
+.settings/
+credentials*.json

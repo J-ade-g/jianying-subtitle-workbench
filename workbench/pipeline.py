@@ -2,6 +2,7 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import argparse, json, math, os, re, shutil, subprocess, traceback, uuid
+from . import semantic
 
 
 def save(path, value):
@@ -68,10 +69,33 @@ def analyze(folder):
     save(folder/'asr.json',raw)
     state(folder,'analyzing','检测长停顿和可疑重复…')
     command(['ffmpeg','-nostdin','-i',str(folder/'original.mp4'),'-af','silencedetect=noise=-35dB:d=0.8','-f','null','-'],folder/'silence.log')
-    plan=candidates(raw,(folder/'silence.log').read_text(),info['source_duration'],info['source_fps'])
-    save(folder/'suggestions.json',plan)
+    propose(folder)
+
+
+def propose(folder):
+    meta=json.loads((folder/'input.json').read_text());opts=meta.get('options',{})
+    info=json.loads((folder/'media.json').read_text());raw=json.loads((folder/'asr.json').read_text())
+    suggestions=candidates(raw,(folder/'silence.log').read_text(),info['source_duration'],info['source_fps'])
+    message='识别完成，请试听并勾选要删除的区间。语气词和重复默认保留。'
+    if opts.get('semantic_mode')=='deepseek':
+        state(folder,'analyzing','DeepSeek 正在分析逐字稿的断句、重点与疑似改口（不上传音视频）…')
+        try:
+            cache=folder/'deepseek_result.json';result=json.loads(cache.read_text()) if cache.exists() else None
+            if not result or result.get('input_sha256')!=semantic.fingerprint(raw,opts):
+                result=semantic.request_plan(raw,opts);save(cache,result)
+            if result.get('error'):raise ValueError(result['error'])
+            save(folder/'semantic_plan.json',semantic.validate_plan(result['plan'],semantic.words(raw)))
+            suggestions+=semantic.cut_suggestions(result['plan'],semantic.words(raw),info['source_duration'],info['source_fps'])
+            message='DeepSeek 分析完成；已生成 AI 断句和重点，删减建议需试听确认。纠错只作提示。'
+        except Exception as exc:
+            if (folder/'semantic_plan.json').exists():(folder/'semantic_plan.json').unlink()
+            message='DeepSeek 未应用，已保留本地规则建议：'+str(exc)
+    save(folder/'suggestions.json',sorted(suggestions,key=lambda c:(c['start'],c['end'])))
     (folder/'逐字稿_识别原文.txt').write_text(raw.get('text',''),encoding='utf-8')
-    state(folder,'review','识别完成，请试听并勾选要删除的区间。语气词和重复默认保留，避免误删。')
+    summary={}
+    if opts.get('semantic_mode')=='deepseek' and (folder/'deepseek_result.json').exists():
+        result=json.loads((folder/'deepseek_result.json').read_text());summary={'model':result.get('model'),'usage':result.get('usage',{}),'cost_estimate':result.get('cost_estimate',{}),'rejected_suggestions':len(result.get('rejected_suggestions',[])),'applied':(folder/'semantic_plan.json').exists()}
+    state(folder,'review',message,ai_summary=summary)
 
 
 def cut_map(duration,cuts):
@@ -95,26 +119,28 @@ def cut_map(duration,cuts):
 def u16(s):return len(s.encode('utf-16-le'))//2
 
 
-def build_project(raw,info,cuts,meta):
+def build_project(raw,info,cuts,meta,plan=None):
     cuts,kept,duration=cut_map(info['source_duration'],cuts)
     def mapped(t):
         for k in kept:
             if k['source_start']<=t<=k['source_end']:return k['output_start']+t-k['source_start']
         return sum(max(0,min(t,k['source_end'])-k['source_start']) for k in kept)
-    events=[];punctuation='，。！？；、,.!?;\n'
-    for seg in raw.get('segments',[]):
-        words=seg.get('words') or [{'word':seg['text'],'start':seg['start'],'end':seg['end']}]
-        for word in words:
-            a,b=float(word['start']),float(word['end']);text=word['word']
-            if any(c['start']<= (a+b)/2<c['end'] for c in cuts):continue
-            for j,ch in enumerate(text):
-                if ch in punctuation:
-                    if events:events[-1]['boundary']=True
-                    continue
-                if ch.isspace() and (not events or events[-1]['ch'].isspace()):continue
-                start=mapped(a+(b-a)*j/max(1,len(text)));end=mapped(a+(b-a)*(j+1)/max(1,len(text)))
-                if end>start:events.append({'ch':ch,'start':start,'end':end,'boundary':False})
-        if events:events[-1]['boundary']=True
+    events=[];punctuation='，。！？；、,.!?;\n�'
+    for word in semantic.words(raw):
+        a,b=word['start'],word['end'];text=word['word'];word_id=word['id']
+        if any(c['start']<= (a+b)/2<c['end'] for c in cuts):continue
+        for j,ch in enumerate(text):
+            if ch in punctuation:
+                if events and not plan:events[-1]['boundary']=True
+                continue
+            if ch.isspace() and (not events or events[-1]['ch'].isspace()):continue
+            start=mapped(a+(b-a)*j/max(1,len(text)));end=mapped(a+(b-a)*(j+1)/max(1,len(text)))
+            if end>start:events.append({'ch':ch,'start':start,'end':end,'boundary':False,'word_id':word_id})
+        if events and (plan and word_id in plan['break_after']):events[-1]['boundary']=True
+    if not plan:
+        segment_ends={round(float(seg['end']),4) for seg in raw.get('segments',[]) if 'end' in seg}
+        for event in events:
+            if any(abs(event['end']-mapped(t))<.002 for t in segment_ends):event['boundary']=True
     while events and events[-1]['ch'].isspace():events.pop()
     if not events:raise ValueError('没有识别到有效语音，请检查音轨或换一个视频')
     # Whisper timestamps may overlap. Build ordered starts and leave a small positive interval.
@@ -124,12 +150,12 @@ def build_project(raw,info,cuts,meta):
     maxchars=max(10,min(40,int(meta.get('options',{}).get('max_chars',22))))
     groups=[];buf=[]
     for i,e in enumerate(events):
-        if buf and e['start']-buf[-1]['end']>.65:groups.append(buf);buf=[]
+        if buf and not plan and e['start']-buf[-1]['end']>.65:groups.append(buf);buf=[]
         buf.append(e)
         # Avoid splitting ASCII words; a very long ASCII word can exceed the target length.
         nextch=events[i+1]['ch'] if i+1<n else ''
         ascii_word=e['ch'].isascii() and e['ch'].isalnum() and nextch.isascii() and nextch.isalnum()
-        if (e['boundary'] or len(buf)>=maxchars) and not ascii_word:groups.append(buf);buf=[]
+        if (e['boundary'] or len(buf)>=maxchars*(1.4 if plan else 1)) and not ascii_word:groups.append(buf);buf=[]
     if buf:groups.append(buf)
     styles={'focus':{'name':'重点 · 黄色加粗','color':'#ffd65a','bold':True,'scale':1.0},'term':{'name':'关键词 · 浅蓝','color':'#8dd6ff','bold':True,'scale':1.0},'number':{'name':'数字 · 橙色','color':'#ffc28a','bold':True,'scale':1.06}}
     keywords=[s.strip() for s in re.split(r'[,，\n]',meta.get('options',{}).get('keywords','')) if s.strip()]
@@ -139,15 +165,20 @@ def build_project(raw,info,cuts,meta):
         while group and group[-1]['ch'].isspace():group=group[:-1]
         if not group:continue
         text=''.join(e['ch'] for e in group);emphasis=[]
-        matches=[(m.start(),m.end(),'number') for m in re.finditer(r'\d+(?:\.\d+)?(?:%|％|万|亿|千|元|条|个|倍|秒|分钟)?',text)]
-        for word in keywords:
-            matches.extend((m.start(),m.end(),'term') for m in re.finditer(re.escape(word),text))
-        for signal in ['最重要','关键','核心','必须','注意']:
-            at=text.find(signal)
-            if at>=0:matches.append((at,min(len(text),at+10),'focus'))
-        for a,b,style in sorted(matches,key=lambda x:({'term':0,'number':1,'focus':2}[x[2]],x[0],-(x[1]-x[0]))):
-            a,b=u16(text[:a]),u16(text[:b])
-            if not any(a<e['end'] and b>e['start'] for e in emphasis):emphasis.append({'start':a,'end':b,'style':style})
+        if plan:
+            for h in plan.get('highlights',[]):
+                positions=[i for i,e in enumerate(group) if h['a']<=e['word_id']<=h['b']]
+                if positions:emphasis.append({'start':u16(text[:positions[0]]),'end':u16(text[:positions[-1]+1]),'style':h['style']})
+        else:
+            matches=[(m.start(),m.end(),'number') for m in re.finditer(r'\d+(?:\.\d+)?(?:%|％|万|亿|千|元|条|个|倍|秒|分钟)?',text)]
+            for word in keywords:
+                matches.extend((m.start(),m.end(),'term') for m in re.finditer(re.escape(word),text))
+            for signal in ['最重要','关键','核心','必须','注意']:
+                at=text.find(signal)
+                if at>=0:matches.append((at,min(len(text),at+10),'focus'))
+            for a,b,style in sorted(matches,key=lambda x:({'term':0,'number':1,'focus':2}[x[2]],x[0],-(x[1]-x[0]))):
+                a,b=u16(text[:a]),u16(text[:b])
+                if not any(a<e['end'] and b>e['start'] for e in emphasis):emphasis.append({'start':a,'end':b,'style':style})
         emphasis.sort(key=lambda e:e['start'])
         times=[]
         for e in group:
@@ -159,7 +190,16 @@ def build_project(raw,info,cuts,meta):
 def finalize(folder):
     state(folder,'rendering','生成预剪视频和可编辑字幕…')
     meta=json.loads((folder/'input.json').read_text());info=json.loads((folder/'media.json').read_text());raw=json.loads((folder/'asr.json').read_text());cuts=json.loads((folder/'selected_cuts.json').read_text())
-    project=build_project(raw,info,cuts,meta);save(folder/'字幕项目_已修改.json',project)
+    plan=json.loads((folder/'semantic_plan.json').read_text()) if (folder/'semantic_plan.json').exists() else None
+    project=build_project(raw,info,cuts,meta,plan)
+    if plan:
+        result=json.loads((folder/'deepseek_result.json').read_text());project['semantic_provider']='deepseek';project['ai_usage']=result['usage'];project['ai_cost_estimate']=result['cost_estimate']
+        project['review_notes'][1]='本项目断句和重点来自 DeepSeek；程序按字数设有安全回退。请试听核对。'
+        source_words=semantic.words(raw)
+        for correction in plan.get('corrections',[]):
+            old=''.join(w['word'] for w in source_words[correction['a']:correction['b']+1])
+            project['review_notes'].append('AI 纠错建议（未自动应用）：'+old+' → '+correction['text']+'。'+correction.get('reason',''))
+    save(folder/'字幕项目_已修改.json',project)
     if cuts:
         ranges=project['kept'];n=len(ranges)
         vf='+'.join(f'between(t,{k["source_start"]:.9f},{k["source_end"]-1e-9:.9f})' for k in ranges)
