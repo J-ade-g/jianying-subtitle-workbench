@@ -1,0 +1,4 @@
+{
+  "JSW_PORT": 8766,
+  "JSW_WHISPER_MODEL": "mlx-community/whisper-large-v3-turbo"
+}

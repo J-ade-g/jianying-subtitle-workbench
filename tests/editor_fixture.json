@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "demo-editor",
+  "title": "演示",
+  "duration": 20,
+  "source_duration": 20,
+  "kept": [
+    {
+      "source_start": 0,
+      "source_end": 20,
+      "output_start": 0,
+      "output_end": 20
+    }
+  ],
+  "styles": {
+    "focus": {
+      "name": "重点",
+      "color": "#ffd65a",
+      "bold": true,
+      "scale": 1
+    }
+  },
+  "captions": [
+    {
+      "id": "demo1",
+      "start": 0,
+      "end": 10,
+      "text": "这是一个演示字幕用来测试断句和重点的调整",
+      "emphasis": [
+        {
+          "start": 2,
+          "end": 5,
+          "style": "focus"
+        }
+      ]
+    },
+    {
+      "id": "demo2",
+      "start": 10,
+      "end": 20,
+      "text": "第二句继续验证样式可以保存和继续修改",
+      "emphasis": [
+        {
+          "start": 2,
+          "end": 5,
+          "style": "focus"
+        }
+      ]
+    }
+  ],
+  "cuts": [],
+  "review_notes": []
+}

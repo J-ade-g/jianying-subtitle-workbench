@@ -1,0 +1,15 @@
+.venv
+__pycache__/
+*.pyc
+.DS_Store
+.local-config.json
+.env
+.env.*
+data/
+models/
+logs/
+*.mp4
+*.mov
+*.wav
+*.safetensors
+*.log
